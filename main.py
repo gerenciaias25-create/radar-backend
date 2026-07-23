@@ -33,7 +33,12 @@ def limpiar_texto(texto: str) -> str:
 async def extraer_datos_apify(nombre: str, fecha_ctx: str):
     apify_token = os.getenv("APIFY_API_TOKEN")
     if not apify_token:
-        return "No hay token de Apify. Generando análisis por contexto."
+        return {
+            "resumen_raw": "No hay token de Apify disponible.",
+            "tweets": [],
+            "noticias": [],
+            "fb": []
+        }
 
     async with httpx.AsyncClient(timeout=45.0) as client:
         task_tweets = client.post(
@@ -69,7 +74,7 @@ async def extraer_datos_apify(nombre: str, fecha_ctx: str):
         for t in res_tweets.json()[:20]:
             txt = limpiar_texto(t.get("text") or t.get("fullText") or "")
             if txt:
-                tweets_clean.append(f"[@{t.get('author',{}).get('userName','anon')}]: {txt}")
+                tweets_clean.append({"autor": f"@{t.get('author',{}).get('userName','anon')}", "texto": txt})
 
     noticias_clean = []
     if not isinstance(res_noticias, Exception) and res_noticias.status_code == 200:
@@ -77,28 +82,35 @@ async def extraer_datos_apify(nombre: str, fecha_ctx: str):
             for r in item.get("organicResults", [])[:15]:
                 title = limpiar_texto(r.get("title", ""))
                 desc = limpiar_texto(r.get("description", ""))
-                noticias_clean.append(f"TITULAR: {title}\nRESUMEN: {desc}")
+                noticias_clean.append({"titulo": title, "resumen": desc})
 
     fb_clean = []
     if not isinstance(res_fb, Exception) and res_fb.status_code == 200:
         for f in res_fb.json()[:15]:
             txt = limpiar_texto(f.get("text") or f.get("caption") or "")
             if txt:
-                fb_clean.append(f"[FB Post]: {txt}")
+                fb_clean.append({"texto": txt})
 
-    return (
+    resumen_raw = (
         f"=== CONTEXTO EXTRAÍDO Y LIMPIO PARA '{nombre}' ===\n\n"
-        f"--- TWITTER/X ---\n" + "\n".join(tweets_clean) + "\n\n"
-        f"--- PRENSA Y MEDIOS ---\n" + "\n---\n".join(noticias_clean) + "\n\n"
-        f"--- FACEBOOK ---\n" + "\n".join(fb_clean)
+        f"--- TWITTER/X ---\n" + "\n".join([f"[{t['autor']}]: {t['texto']}" for t in tweets_clean]) + "\n\n"
+        f"--- PRENSA Y MEDIOS ---\n" + "\n---\n".join([f"TITULAR: {n['titulo']}\nRESUMEN: {n['resumen']}" for n in noticias_clean]) + "\n\n"
+        f"--- FACEBOOK ---\n" + "\n".join([f"[FB Post]: {f['texto']}" for f in fb_clean])
     )
+
+    return {
+        "resumen_raw": resumen_raw,
+        "tweets": tweets_clean,
+        "noticias": noticias_clean,
+        "fb": fb_clean
+    }
 
 @app.post("/api/analizar")
 async def analizar_actor(payload: RequestPayload):
     nombre = payload.nombre.strip()
     fecha_ctx = payload.fecha or "julio 2026"
 
-    contexto = await extraer_datos_apify(nombre, fecha_ctx)
+    datos_apify = await extraer_datos_apify(nombre, fecha_ctx)
     openrouter_key = os.getenv("OPENROUTER_API_KEY")
     if not openrouter_key:
         raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY requerida")
@@ -106,7 +118,7 @@ async def analizar_actor(payload: RequestPayload):
     prompt = f"""Eres un Director General de Inteligencia Político-Digital. Fecha: {fecha_ctx}.
 
 DATOS REALES EXTRAÍDOS Y PROCESADOS EN PYTHON PARA "{nombre}":
-{contexto}
+{datos_apify["resumen_raw"]}
 
 INSTRUCCIÓN: Devuelve UNICAMENTE un JSON estructurado con explicaciones exhaustivas (2 a 3 párrafos en campos explicativos) para no omitir ningún análisis.
 
@@ -264,7 +276,9 @@ Estructura JSON obligatoria:
     if not match:
         raise HTTPException(status_code=500, detail="Respuesta no válida")
 
-    return json.loads(match.group(0))
+    final_result = json.loads(match.group(0))
+    final_result["extraccion_directa"] = datos_apify
+    return final_result
 
 if __name__ == "__main__":
     import uvicorn
